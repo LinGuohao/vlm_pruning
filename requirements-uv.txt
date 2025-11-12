@@ -1,0 +1,16 @@
+# Core
+transformers==4.45.2
+datasets==3.0.1
+accelerate==1.0.1
+tokenizers==0.20.1
+safetensors==0.4.5
+huggingface_hub==0.25.2
+
+# NumPy / Sci
+numpy==1.26.4
+
+# Image / IO
+Pillow==10.4.0
+pyarrow==16.1.0
+tqdm==4.66.5
+packaging==24.1
