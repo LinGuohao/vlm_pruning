@@ -33,15 +33,18 @@ def pca_analysis(data, energy_levels=(0.90, 0.95, 0.99)):
     Returns the number of principal components needed to capture different energy levels.
 
     Args:
-        data: Tensor of shape [batch*seq_len, hidden_dim]
+        data: Tensor of shape [total_tokens, hidden_dim] or [batch, seq_len, hidden_dim]
         energy_levels: Tuple of variance ratios to compute (e.g., 0.99 for 99%)
 
     Returns:
         Dictionary with PCA results
     """
-    # Flatten batch and sequence dimensions: [batch, seq_len, hidden_dim] -> [batch*seq_len, hidden_dim]
+    # Flatten to 2D if needed: [batch, seq_len, hidden_dim] -> [batch*seq_len, hidden_dim]
     if len(data.shape) == 3:
         data = data.view(-1, data.shape[-1])
+
+    # Should be 2D now: [num_samples, hidden_dim]
+    assert len(data.shape) == 2, f"Expected 2D data, got shape {data.shape}"
 
     # Move to CPU if needed
     if data.device.type == 'cuda':
@@ -90,10 +93,11 @@ def pca_analysis(data, energy_levels=(0.90, 0.95, 0.99)):
 def register_ffn_hooks(model, activations_dict):
     """
     Register forward hooks to capture FFN first layer outputs (gate_proj).
+    Accumulates activations from multiple forward passes.
 
     Args:
         model: The LLaVA model
-        activations_dict: Dictionary to store activations
+        activations_dict: Dictionary to store list of activations
 
     Returns:
         List of hook handles
@@ -108,9 +112,12 @@ def register_ffn_hooks(model, activations_dict):
 
         def make_hook(layer_id):
             def hook_fn(module, input, output):
-                # Store the activation (detach to avoid keeping computation graph)
+                # Accumulate activations from each forward pass
                 # output shape: [batch_size, seq_len, hidden_dim]
-                activations_dict[f'layer_{layer_id}_gate_proj'] = output.detach().cpu()
+                key = f'layer_{layer_id}_gate_proj'
+                if key not in activations_dict:
+                    activations_dict[key] = []
+                activations_dict[key].append(output.detach().cpu())
             return hook_fn
 
         # Register hook on gate_proj output
@@ -120,14 +127,16 @@ def register_ffn_hooks(model, activations_dict):
     return hooks
 
 
-def extract_activations(model_path, dataset_path, output_dir, device='cuda'):
+def extract_activations(model_path, dataset_path, output_dir, num_samples=1, batch_size=4, device='cuda'):
     """
-    Extract FFN activations from one example.
+    Extract FFN activations from dataset examples.
 
     Args:
         model_path: Path to LLaVA model
         dataset_path: Path to OCR-VQA dataset
-        output_dir: Directory to save activations
+        output_dir: Directory to save results
+        num_samples: Number of examples to process
+        batch_size: Batch size for processing
         device: Device to run on
     """
     print(f"Loading model from {model_path}...")
@@ -151,23 +160,6 @@ def extract_activations(model_path, dataset_path, output_dir, device='cuda'):
     print(f"\nLoading dataset from {dataset_path}...")
     dataset = load_dataset(dataset_path)["test"]
 
-    # Take first example
-    example = dataset[0]
-
-    # Prepare input
-    image = example['image'].convert('RGB')
-
-    # Get question (OCR-VQA has 'questions' field which is a list)
-    if 'question' in example:
-        question = example['question']
-    elif 'questions' in example:
-        question = example['questions'][0]
-    else:
-        question = ""
-
-    print(f"\nProcessing first example:")
-    print(f"Question: {question}")
-
     # Determine conversation mode
     if 'llama-2' in model_name.lower():
         conv_mode = "llava_llama_2"
@@ -178,67 +170,136 @@ def extract_activations(model_path, dataset_path, output_dir, device='cuda'):
 
     print(f"Using conversation mode: {conv_mode}")
 
-    # Create conversation
-    conv = conv_templates[conv_mode].copy()
-
-    # Format prompt with image token
-    inp = DEFAULT_IMAGE_TOKEN + '\n' + question
-    conv.append_message(conv.roles[0], inp)
-    conv.append_message(conv.roles[1], None)
-    prompt = conv.get_prompt()
-
-    print(f"Prompt: {prompt[:200]}...")
-
-    # Process image
+    # Prepare Args class for image processing
     class Args:
         image_aspect_ratio = 'pad'
-
     args = Args()
-    image_tensor = process_images([image], image_processor, args)
-    image_tensor = image_tensor.to(device, dtype=torch.float16)
 
-    # Tokenize input
-    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(device)
+    # Dictionary to accumulate activations across all samples
+    accumulated_activations = {}
 
-    print(f"\nInput shape: {input_ids.shape}")
-    print(f"Image tensor shape: {image_tensor.shape}")
-
-    # Dictionary to store activations
-    activations_dict = {}
-
-    # Register hooks
-    print("\nRegistering forward hooks on gate_proj layers...")
-    hooks = register_ffn_hooks(model, activations_dict)
-    print(f"Registered {len(hooks)} hooks")
-
-    # Forward pass
-    print("Running forward pass...")
+    print(f"\nProcessing {num_samples} examples with batch_size={batch_size}...")
     model.eval()
-    with torch.inference_mode():
-        outputs = model(
-            input_ids=input_ids,
-            images=image_tensor,
-            return_dict=True
-        )
 
-    # Remove hooks
+    # Register hooks once before all forward passes
+    hooks = register_ffn_hooks(model, accumulated_activations)
+
+    # Process in batches
+    for batch_start in range(0, num_samples, batch_size):
+        batch_end = min(batch_start + batch_size, num_samples)
+        batch_indices = range(batch_start, batch_end)
+
+        # Prepare batch data
+        batch_images = []
+        batch_prompts = []
+
+        for sample_idx in batch_indices:
+            example = dataset[sample_idx]
+
+            # Prepare input
+            image = example['image'].convert('RGB')
+
+            # Get question
+            if 'question' in example:
+                question = example['question']
+            elif 'questions' in example:
+                question = example['questions'][0]
+            else:
+                question = ""
+
+            if sample_idx == 0:
+                print(f"First example - Question: {question}")
+
+            # Create conversation
+            conv = conv_templates[conv_mode].copy()
+
+            # Format prompt with image token
+            inp = DEFAULT_IMAGE_TOKEN + '\n' + question
+            conv.append_message(conv.roles[0], inp)
+            conv.append_message(conv.roles[1], None)
+            prompt = conv.get_prompt()
+
+            batch_images.append(image)
+            batch_prompts.append(prompt)
+
+        # Process images (batch)
+        image_tensors = process_images(batch_images, image_processor, args)
+        image_tensors = image_tensors.to(device, dtype=torch.float16)
+
+        # Tokenize inputs with padding
+        input_ids_list = []
+        for prompt in batch_prompts:
+            input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
+            input_ids_list.append(input_ids)
+
+        # Pad to same length
+        max_len = max(ids.shape[0] for ids in input_ids_list)
+        padded_input_ids = []
+        attention_masks = []
+
+        for input_ids in input_ids_list:
+            padding_length = max_len - input_ids.shape[0]
+            # Pad with tokenizer.pad_token_id (or 0 if not available)
+            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+            padded_ids = torch.cat([input_ids, torch.full((padding_length,), pad_id, dtype=input_ids.dtype)])
+            padded_input_ids.append(padded_ids)
+
+            # Create attention mask (1 for real tokens, 0 for padding)
+            attention_mask = torch.cat([torch.ones(input_ids.shape[0], dtype=torch.long),
+                                       torch.zeros(padding_length, dtype=torch.long)])
+            attention_masks.append(attention_mask)
+
+        # Stack into batch tensors
+        input_ids_batch = torch.stack(padded_input_ids).to(device)
+        attention_mask_batch = torch.stack(attention_masks).to(device)
+
+        if batch_start == 0:
+            print(f"Batch input shape: {input_ids_batch.shape}")
+            print(f"Batch image tensor shape: {image_tensors.shape}")
+            print(f"Batch attention mask shape: {attention_mask_batch.shape}")
+
+        # Forward pass - hooks will automatically capture activations
+        with torch.inference_mode():
+            outputs = model(
+                input_ids=input_ids_batch,
+                attention_mask=attention_mask_batch,
+                images=image_tensors,
+                return_dict=True
+            )
+
+        print(f"Processed {batch_end}/{num_samples} samples")
+
+    # Remove hooks after all forward passes
     for hook in hooks:
         hook.remove()
 
+    # Concatenate all activations by flattening batch and sequence dimensions
+    print(f"\nConcatenating activations from {num_samples} samples...")
+    concatenated_activations = {}
+    for key in sorted(accumulated_activations.keys()):
+        # Each item in list is [batch_size, seq_len, hidden_dim]
+        # Flatten all dimensions except last: [batch*seq_len, hidden_dim]
+        flattened = [tensor.view(-1, tensor.shape[-1]) for tensor in accumulated_activations[key]]
+        # Concatenate along token dimension to [total_tokens, hidden_dim]
+        concatenated_activations[key] = torch.cat(flattened, dim=0)
+        if key == 'layer_0_gate_proj':
+            print(f"Concatenated shape for {key}: {concatenated_activations[key].shape}")
+
     # Print activation shapes
-    print(f"\nExtracted {len(activations_dict)} layer activations:")
-    for key in sorted(activations_dict.keys()):
-        print(f"  {key}: {activations_dict[key].shape}")
+    print(f"\nExtracted activations for {len(concatenated_activations)} layers:")
+    for key in sorted(concatenated_activations.keys()):
+        print(f"  {key}: {concatenated_activations[key].shape}")
 
     # Perform PCA analysis on each layer
     print("\n" + "=" * 80)
     print("Performing PCA Analysis on Each Layer")
+    print(f"Data from {num_samples} samples will be used for PCA")
     print("=" * 80)
 
     pca_results = {}
-    for key in sorted(activations_dict.keys()):
+    for key in sorted(concatenated_activations.keys()):
         print(f"\nAnalyzing {key}...")
-        activation = activations_dict[key]
+        activation = concatenated_activations[key]
         pca_result = pca_analysis(activation, energy_levels=(0.90, 0.95, 0.99))
         pca_results[key] = pca_result
 
@@ -250,20 +311,14 @@ def extract_activations(model_path, dataset_path, output_dir, device='cuda'):
             ratio = stats['ratio']
             print(f"    {energy_level} variance: {num_comp}/{total} components ({ratio*100:.2f}%)")
 
-    # Save activations
+    # Save PCA results (no longer saving activations pt file)
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, 'ffn_gate_proj_activations.pt')
     pca_results_path = os.path.join(output_dir, 'pca_analysis_results.json')
 
-    print(f"\nSaving activations to {output_path}...")
-    torch.save(activations_dict, output_path)
-
-    print(f"Saving PCA results to {pca_results_path}...")
+    print(f"\nSaving PCA results to {pca_results_path}...")
     with open(pca_results_path, 'w') as f:
         json.dump(pca_results, f, indent=2)
 
-    print(f"\nDone! Saved {len(activations_dict)} layer activations.")
-    print(f"Activations file size: {os.path.getsize(output_path) / 1024 / 1024:.2f} MB")
     print(f"PCA results file size: {os.path.getsize(pca_results_path) / 1024:.2f} KB")
 
     # Print summary (sorted by layer number)
@@ -302,7 +357,7 @@ def extract_activations(model_path, dataset_path, output_dir, device='cuda'):
 
     print(f"\nSorted summary saved to {summary_path}")
 
-    return activations_dict, pca_results
+    return pca_results
 
 
 def main():
@@ -310,6 +365,8 @@ def main():
     model_path = "/gpfs/volcano/models/llava-v1.5-7b"
     dataset_path = "/gpfs/volcano/models/howard-hou-OCR-VQA"
     output_dir = "./ffn_activations"
+    num_samples = 64  # Number of samples to process
+    batch_size = 64  # Batch size for processing
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 80)
@@ -318,16 +375,17 @@ def main():
     print(f"Model: {model_path}")
     print(f"Dataset: {dataset_path}")
     print(f"Output: {output_dir}")
+    print(f"Num samples: {num_samples}")
+    print(f"Batch size: {batch_size}")
     print(f"Device: {device}")
     print("=" * 80)
 
-    activations, pca_results = extract_activations(model_path, dataset_path, output_dir, device)
+    pca_results = extract_activations(model_path, dataset_path, output_dir, num_samples, batch_size, device)
 
     print("\n" + "=" * 80)
     print("Extraction Summary:")
-    print(f"Number of layers: {len(activations)}")
-    print("Expected: 32 layers (one for each Transformer layer)")
     print(f"PCA analysis completed for all {len(pca_results)} layers")
+    print(f"Expected: 32 layers (one for each Transformer layer)")
     print("=" * 80)
 
 
