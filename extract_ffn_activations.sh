@@ -1,2 +1,2 @@
-export CUDA_VISIBLE_DEVICES=7
+export CUDA_VISIBLE_DEVICES=3
 python extract_ffn_activations.py

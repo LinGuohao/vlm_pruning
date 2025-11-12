@@ -8,12 +8,83 @@ import torch
 import torch.nn as nn
 from datasets import load_dataset
 import os
+import numpy as np
+import json
 
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
 from llava.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
 from llava.conversation import conv_templates
+
+
+def cov(tensor, rowvar=True, bias=False):
+    """Estimate a covariance matrix (np.cov)"""
+    tensor = tensor if rowvar else tensor.transpose(-1, -2)
+    tensor = tensor - tensor.mean(dim=-1, keepdim=True)
+    factor = 1 / (tensor.shape[-1] - int(not bool(bias)))
+    return factor * tensor @ tensor.transpose(-1, -2).conj()
+
+
+@torch.no_grad()
+def pca_analysis(data, energy_levels=(0.90, 0.95, 0.99)):
+    """
+    Perform PCA analysis on the data.
+    Returns the number of principal components needed to capture different energy levels.
+
+    Args:
+        data: Tensor of shape [batch*seq_len, hidden_dim]
+        energy_levels: Tuple of variance ratios to compute (e.g., 0.99 for 99%)
+
+    Returns:
+        Dictionary with PCA results
+    """
+    # Flatten batch and sequence dimensions: [batch, seq_len, hidden_dim] -> [batch*seq_len, hidden_dim]
+    if len(data.shape) == 3:
+        data = data.view(-1, data.shape[-1])
+
+    # Move to CPU if needed
+    if data.device.type == 'cuda':
+        data = data.cpu()
+
+    # Convert to float32 (eigh doesn't support float16)
+    if data.dtype == torch.float16:
+        data = data.float()
+
+    # Center the data
+    data = data - data.mean(0)
+
+    # Compute covariance matrix
+    covariance = cov(data, rowvar=False)
+
+    # Compute eigenvalues (sorted small to large)
+    eigenvalues, _ = torch.linalg.eigh(covariance)
+
+    # Convert to numpy for easier computation
+    eigenvalues = eigenvalues.numpy()
+
+    # Compute results for each energy level
+    results = {}
+    total = np.sum(eigenvalues)
+    total_components = len(eigenvalues)
+
+    for energy in energy_levels:
+        accum = 0
+        k = 1
+        while accum < energy and k <= total_components:
+            accum += eigenvalues[-k] / total
+            k += 1
+        num_components = k - 1
+        results[f'{int(energy*100)}%'] = {
+            'num_components': int(num_components),
+            'actual_variance': float(accum),
+            'ratio': float(num_components / total_components)
+        }
+
+    return {
+        'total_components': int(total_components),
+        'energy_levels': results
+    }
 
 
 def register_ffn_hooks(model, activations_dict):
@@ -159,17 +230,79 @@ def extract_activations(model_path, dataset_path, output_dir, device='cuda'):
     for key in sorted(activations_dict.keys()):
         print(f"  {key}: {activations_dict[key].shape}")
 
+    # Perform PCA analysis on each layer
+    print("\n" + "=" * 80)
+    print("Performing PCA Analysis on Each Layer")
+    print("=" * 80)
+
+    pca_results = {}
+    for key in sorted(activations_dict.keys()):
+        print(f"\nAnalyzing {key}...")
+        activation = activations_dict[key]
+        pca_result = pca_analysis(activation, energy_levels=(0.90, 0.95, 0.99))
+        pca_results[key] = pca_result
+
+        # Print results
+        total = pca_result['total_components']
+        print(f"  Total dimensions: {total}")
+        for energy_level, stats in pca_result['energy_levels'].items():
+            num_comp = stats['num_components']
+            ratio = stats['ratio']
+            print(f"    {energy_level} variance: {num_comp}/{total} components ({ratio*100:.2f}%)")
+
     # Save activations
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, 'ffn_gate_proj_activations.pt')
+    pca_results_path = os.path.join(output_dir, 'pca_analysis_results.json')
 
     print(f"\nSaving activations to {output_path}...")
     torch.save(activations_dict, output_path)
 
-    print(f"Done! Saved {len(activations_dict)} layer activations.")
-    print(f"File size: {os.path.getsize(output_path) / 1024 / 1024:.2f} MB")
+    print(f"Saving PCA results to {pca_results_path}...")
+    with open(pca_results_path, 'w') as f:
+        json.dump(pca_results, f, indent=2)
 
-    return activations_dict
+    print(f"\nDone! Saved {len(activations_dict)} layer activations.")
+    print(f"Activations file size: {os.path.getsize(output_path) / 1024 / 1024:.2f} MB")
+    print(f"PCA results file size: {os.path.getsize(pca_results_path) / 1024:.2f} KB")
+
+    # Print summary (sorted by layer number)
+    print("\n" + "=" * 80)
+    print("PCA Analysis Summary (99% variance)")
+    print("=" * 80)
+
+    # Create summary list with layer info
+    summary_list = []
+    for key in sorted(pca_results.keys()):
+        result = pca_results[key]
+        num_comp_99 = result['energy_levels']['99%']['num_components']
+        total = result['total_components']
+        ratio = result['energy_levels']['99%']['ratio']
+        layer_num = int(key.split('_')[1])
+        summary_list.append({
+            'layer': layer_num,
+            'num_components': num_comp_99,
+            'total_components': total,
+            'ratio': ratio,
+            'percentage': ratio * 100
+        })
+        print(f"Layer {layer_num:2d}: {num_comp_99:5d}/{total} components ({ratio*100:5.2f}%)")
+
+    # Sort by percentage (ascending order)
+    summary_sorted = sorted(summary_list, key=lambda x: x['percentage'])
+
+    # Save sorted summary to file
+    summary_path = os.path.join(output_dir, 'pca_summary_sorted.txt')
+    with open(summary_path, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write("PCA Analysis Summary (99% variance) - Sorted by Percentage\n")
+        f.write("=" * 80 + "\n")
+        for item in summary_sorted:
+            f.write(f"Layer {item['layer']:2d}: {item['num_components']:5d}/{item['total_components']} components ({item['percentage']:5.2f}%)\n")
+
+    print(f"\nSorted summary saved to {summary_path}")
+
+    return activations_dict, pca_results
 
 
 def main():
@@ -188,12 +321,13 @@ def main():
     print(f"Device: {device}")
     print("=" * 80)
 
-    activations = extract_activations(model_path, dataset_path, output_dir, device)
+    activations, pca_results = extract_activations(model_path, dataset_path, output_dir, device)
 
     print("\n" + "=" * 80)
     print("Extraction Summary:")
     print(f"Number of layers: {len(activations)}")
     print("Expected: 32 layers (one for each Transformer layer)")
+    print(f"PCA analysis completed for all {len(pca_results)} layers")
     print("=" * 80)
 
 
