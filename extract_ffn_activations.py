@@ -6,18 +6,19 @@ after the first layer of each FFN block (gate_proj output) in the LLaMA decoder.
 
 import torch
 import torch.nn as nn
-from transformers import AutoProcessor, LlavaForConditionalGeneration
 from datasets import load_dataset
 import os
-from tqdm import tqdm
-import numpy as np
+
+from llava.model.builder import load_pretrained_model
+from llava.utils import disable_torch_init
+from llava.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
+from llava.conversation import conv_templates
 
 
 def register_ffn_hooks(model, activations_dict):
     """
-    Register forward hooks to capture FFN first layer outputs.
-    For LLaMA, the FFN structure is: gate_proj + up_proj -> silu -> down_proj
-    We want to capture the output after gate_proj (before activation).
+    Register forward hooks to capture FFN first layer outputs (gate_proj).
 
     Args:
         model: The LLaVA model
@@ -29,10 +30,8 @@ def register_ffn_hooks(model, activations_dict):
     hooks = []
 
     # Access the language model layers
-    language_model = model.language_model
-
-    # LLaMA layers are in model.layers
-    for layer_idx, layer in enumerate(language_model.model.layers):
+    # For LLaVA: model.model.layers contains the LLaMA decoder layers
+    for layer_idx, layer in enumerate(model.model.layers):
         # Each layer has an MLP module with gate_proj, up_proj, down_proj
         mlp = layer.mlp
 
@@ -62,50 +61,94 @@ def extract_activations(model_path, dataset_path, output_dir, device='cuda'):
     """
     print(f"Loading model from {model_path}...")
 
-    # Load model and processor
-    model = LlavaForConditionalGeneration.from_pretrained(
-        model_path,
-        torch_dtype=torch.float16,
-        device_map=device,
-    )
-    processor = AutoProcessor.from_pretrained(model_path)
+    # Disable torch init for faster loading
+    disable_torch_init()
 
-    print(f"Loading dataset from {dataset_path}...")
+    # Load model using LLaVA's builder
+    model_name = get_model_name_from_path(model_path)
+    tokenizer, model, image_processor, context_len = load_pretrained_model(
+        model_path=model_path,
+        model_base=None,
+        model_name=model_name,
+        device=device
+    )
+
+    print(f"Model loaded: {model_name}")
+    print(f"Context length: {context_len}")
+
     # Load dataset
+    print(f"\nLoading dataset from {dataset_path}...")
     dataset = load_dataset(dataset_path)["test"]
 
     # Take first example
     example = dataset[0]
-    print(f"\nProcessing example:")
-    print(f"Question: {example.get('question', 'N/A')}")
-    print(f"Answer: {example.get('answers', 'N/A')}")
 
     # Prepare input
-    # OCR-VQA typically has 'image', 'question', 'answers' fields
-    image = example['image']
-    question = example.get('question', '')
+    image = example['image'].convert('RGB')
 
-    # Format prompt for LLaVA
-    prompt = f"USER: <image>\n{question}\nASSISTANT:"
+    # Get question (OCR-VQA has 'questions' field which is a list)
+    if 'question' in example:
+        question = example['question']
+    elif 'questions' in example:
+        question = example['questions'][0]
+    else:
+        question = ""
 
-    # Process inputs
-    inputs = processor(text=prompt, images=image, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    print(f"\nProcessing first example:")
+    print(f"Question: {question}")
 
-    print(f"\nInput shape: {inputs['input_ids'].shape}")
+    # Determine conversation mode
+    if 'llama-2' in model_name.lower():
+        conv_mode = "llava_llama_2"
+    elif "v1" in model_name.lower():
+        conv_mode = "llava_v1"
+    else:
+        conv_mode = "llava_v0"
+
+    print(f"Using conversation mode: {conv_mode}")
+
+    # Create conversation
+    conv = conv_templates[conv_mode].copy()
+
+    # Format prompt with image token
+    inp = DEFAULT_IMAGE_TOKEN + '\n' + question
+    conv.append_message(conv.roles[0], inp)
+    conv.append_message(conv.roles[1], None)
+    prompt = conv.get_prompt()
+
+    print(f"Prompt: {prompt[:200]}...")
+
+    # Process image
+    class Args:
+        image_aspect_ratio = 'pad'
+
+    args = Args()
+    image_tensor = process_images([image], image_processor, args)
+    image_tensor = image_tensor.to(device, dtype=torch.float16)
+
+    # Tokenize input
+    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).to(device)
+
+    print(f"\nInput shape: {input_ids.shape}")
+    print(f"Image tensor shape: {image_tensor.shape}")
 
     # Dictionary to store activations
     activations_dict = {}
 
     # Register hooks
-    print("Registering forward hooks...")
+    print("\nRegistering forward hooks on gate_proj layers...")
     hooks = register_ffn_hooks(model, activations_dict)
+    print(f"Registered {len(hooks)} hooks")
 
     # Forward pass
     print("Running forward pass...")
     model.eval()
-    with torch.no_grad():
-        outputs = model(**inputs)
+    with torch.inference_mode():
+        outputs = model(
+            input_ids=input_ids,
+            images=image_tensor,
+            return_dict=True
+        )
 
     # Remove hooks
     for hook in hooks:
@@ -114,22 +157,19 @@ def extract_activations(model_path, dataset_path, output_dir, device='cuda'):
     # Print activation shapes
     print(f"\nExtracted {len(activations_dict)} layer activations:")
     for key in sorted(activations_dict.keys()):
-        print(f"{key}: {activations_dict[key].shape}")
+        print(f"  {key}: {activations_dict[key].shape}")
 
     # Save activations
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, 'ffn_activations_layer0.pt')
-
-    # Convert to numpy for smaller file size
-    activations_np = {k: v.numpy() for k, v in activations_dict.items()}
+    output_path = os.path.join(output_dir, 'ffn_gate_proj_activations.pt')
 
     print(f"\nSaving activations to {output_path}...")
-    torch.save(activations_np, output_path)
+    torch.save(activations_dict, output_path)
 
-    print(f"Done! Saved {len(activations_np)} layer activations.")
-    print(f"Total file size: {os.path.getsize(output_path) / 1024 / 1024:.2f} MB")
+    print(f"Done! Saved {len(activations_dict)} layer activations.")
+    print(f"File size: {os.path.getsize(output_path) / 1024 / 1024:.2f} MB")
 
-    return activations_np
+    return activations_dict
 
 
 def main():

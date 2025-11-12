@@ -18,3 +18,7 @@ dependencies:
 
   # 工具
   - uv 
+
+  # Model
+  - sentencepiece
+  - protobuf

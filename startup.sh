@@ -13,6 +13,8 @@ conda activate ${ENV_NAME}
 echo "Installing python dependencies via uv"
 uv pip install -r requirements-uv.txt
 
+uv pip install --no-deps "git+https://github.com/haotian-liu/LLaVA.git"
+
 echo "Done."
 echo "Activate environment with:"
 echo "  conda activate ${ENV_NAME}"
