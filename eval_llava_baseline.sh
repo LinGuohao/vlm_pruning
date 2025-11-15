@@ -1,0 +1,2 @@
+export CUDA_VISIBLE_DEVICES=1
+python eval_llava_baseline.py
