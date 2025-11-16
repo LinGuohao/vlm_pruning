@@ -1,15 +1,17 @@
 """
 Evaluate baseline (unpruned) LLaVA model on OCR-VQA dataset.
 This script serves as a baseline for comparison with pruned models.
+Uses ROUGE metric like FastV.
 """
+
+import os
+import json
+from datetime import datetime
+import re
 
 import torch
 from datasets import load_dataset
-import os
-import json
 from tqdm import tqdm
-import argparse
-from datetime import datetime
 
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
@@ -17,199 +19,228 @@ from llava.mm_utils import process_images, tokenizer_image_token, get_model_name
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
 from llava.conversation import conv_templates
 
+# ============ Text normalization (from FastV) ============
+contractions = {"aint": "ain't", "arent": "aren't", "cant": "can't", "couldve": "could've", "couldnt": "couldn't", \
+                "couldn'tve": "couldn't've", "couldnt've": "couldn't've", "didnt": "didn't", "doesnt": "doesn't", "dont": "don't", "hadnt": "hadn't", \
+                "hadnt've": "hadn't've", "hadn'tve": "hadn't've", "hasnt": "hasn't", "havent": "haven't", "hed": "he'd", "hed've": "he'd've", \
+                "he'dve": "he'd've", "hes": "he's", "howd": "how'd", "howll": "how'll", "hows": "how's", "Id've": "I'd've", "I'dve": "I'd've", \
+                "Im": "I'm", "Ive": "I've", "isnt": "isn't", "itd": "it'd", "itd've": "it'd've", "it'dve": "it'd've", "itll": "it'll", "let's": "let's", \
+                "maam": "ma'am", "mightnt": "mightn't", "mightnt've": "mightn't've", "mightn'tve": "mightn't've", "mightve": "might've", \
+                "mustnt": "mustn't", "mustve": "must've", "neednt": "needn't", "notve": "not've", "oclock": "o'clock", "oughtnt": "oughtn't", \
+                "ow's'at": "'ow's'at", "'ows'at": "'ow's'at", "'ow'sat": "'ow's'at", "shant": "shan't", "shed've": "she'd've", "she'dve": "she'd've", \
+                "she's": "she's", "shouldve": "should've", "shouldnt": "shouldn't", "shouldnt've": "shouldn't've", "shouldn'tve": "shouldn't've", \
+                "somebody'd": "somebodyd", "somebodyd've": "somebody'd've", "somebody'dve": "somebody'd've", "somebodyll": "somebody'll", \
+                "somebodys": "somebody's", "someoned": "someone'd", "someoned've": "someone'd've", "someone'dve": "someone'd've", \
+                "someonell": "someone'll", "someones": "someone's", "somethingd": "something'd", "somethingd've": "something'd've", \
+                "something'dve": "something'd've", "somethingll": "something'll", "thats": "that's", "thered": "there'd", "thered've": "there'd've", \
+                "there'dve": "there'd've", "therere": "there're", "theres": "there's", "theyd": "they'd", "theyd've": "they'd've", \
+                "they'dve": "they'd've", "theyll": "they'll", "theyre": "they're", "theyve": "they've", "twas": "'twas", "wasnt": "wasn't", \
+                "wed've": "we'd've", "we'dve": "we'd've", "weve": "we've", "werent": "weren't", "whatll": "what'll", "whatre": "what're", \
+                "whats": "what's", "whatve": "what've", "whens": "when's", "whered": "where'd", "wheres": "where's", "whereve": "where've", \
+                "whod": "who'd", "whod've": "who'd've", "who'dve": "who'd've", "wholl": "who'll", "whos": "who's", "whove": "who've", "whyll": "why'll", \
+                "whyre": "why're", "whys": "why's", "wont": "won't", "wouldve": "would've", "wouldnt": "wouldn't", "wouldnt've": "wouldn't've", \
+                "wouldn'tve": "wouldn't've", "yall": "y'all", "yall'll": "y'all'll", "y'allll": "y'all'll", "yall'd've": "y'all'd've", \
+                "y'alld've": "y'all'd've", "y'all'dve": "y'all'd've", "youd": "you'd", "youd've": "you'd've", "you'dve": "you'd've", \
+                "youll": "you'll", "youre": "you're", "youve": "you've"}
+manualMap = {'none': '0', 'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10'}
+articles = ['a', 'an', 'the']
+periodStrip = re.compile("(?!<=\d)(\.)(?!\d)")
+commaStrip = re.compile("(\d)(\,)(\d)")
+punct = [';', r"/", '[', ']', '"', '{', '}', '(', ')', '=', '+', '\\', '_', '-', '>', '<', '@', '`', ',', '?', '!']
 
-def evaluate_ocrvqa(model, tokenizer, image_processor, dataset, num_eval_samples, device, batch_size=8):
+def processPunctuation(inText):
+    outText = inText
+    for p in punct:
+        if (p + ' ' in inText or ' ' + p in inText) or (re.search(commaStrip, inText) != None):
+            outText = outText.replace(p, '')
+        else:
+            outText = outText.replace(p, ' ')
+    outText = periodStrip.sub("", outText, re.UNICODE)
+    return outText
+
+def processDigitArticle(inText):
+    outText = []
+    tempText = inText.lower().split()
+    for word in tempText:
+        word = manualMap.setdefault(word, word)
+        if word not in articles:
+            outText.append(word)
+    for wordId, word in enumerate(outText):
+        if word in contractions:
+            outText[wordId] = contractions[word]
+    outText = ' '.join(outText)
+    return outText
+
+def clean_text(pred):
+    pred = pred.replace('\n', ' ')
+    pred = pred.replace('\t', ' ')
+    pred = pred.strip()
+    pred = processPunctuation(pred)
+    pred = processDigitArticle(pred)
+    return pred
+
+
+def evaluate_ocrvqa(model, tokenizer, image_processor, dataset, num_eval_samples, device):
     """
-    Evaluate model on OCR-VQA dataset with batch processing.
-    Returns generated answers for comparison.
+    Evaluate model on OCR-VQA dataset (single sample loop like FastV).
     """
-    print("="*80)
-    print(f"Evaluating on OCR-VQA ({num_eval_samples} samples, batch_size={batch_size})")
-    print("="*80)
+    print("=" * 80)
+    print(f"Evaluating on OCR-VQA ({num_eval_samples} samples, greedy decoding)")
+    print("=" * 80)
 
     # Determine conversation mode
     model_name = model.config._name_or_path
-    if 'llama-2' in model_name.lower():
+    if "llama-2" in model_name.lower():
         conv_mode = "llava_llama_2"
     elif "v1" in model_name.lower():
         conv_mode = "llava_v1"
     else:
         conv_mode = "llava_v0"
 
+    # Args for process_images
     class Args:
-        image_aspect_ratio = 'pad'
+        image_aspect_ratio = "pad"
+
     args = Args()
 
-    results = []
     model.eval()
+    predictions = []
+    labels = []
 
-    # Process in batches
-    num_batches = (num_eval_samples + batch_size - 1) // batch_size
+    skipped = 0
 
-    for batch_idx in tqdm(range(num_batches), desc="Evaluating"):
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, num_eval_samples)
-        batch_examples = [dataset[i] for i in range(start_idx, end_idx)]
+    for idx in tqdm(range(num_eval_samples), desc="Evaluating"):
+        example = dataset[idx]
 
-        batch_images = []
-        batch_input_ids = []
-        batch_questions = []
-        batch_answers = []
-
-        for example in batch_examples:
-            image = example['image'].convert('RGB')
-
-            # Get question and answer
-            if 'question' in example:
-                question = example['question']
-            elif 'questions' in example:
-                question = example['questions'][0]
-            else:
-                question = ""
-
-            if 'answer' in example:
-                answer = example['answer']
-            elif 'answers' in example:
-                answer = example['answers'][0]
-            else:
-                answer = ""
-
-            # Create conversation
-            conv = conv_templates[conv_mode].copy()
-            inp = DEFAULT_IMAGE_TOKEN + '\n' + question
-            conv.append_message(conv.roles[0], inp)
-            conv.append_message(conv.roles[1], None)
-            prompt = conv.get_prompt()
-
-            # Process image
+        # Image processing
+        try:
+            image = example["image"]
+            # Skip tiny images
+            if image.size[0] < 2 or image.size[1] < 2:
+                skipped += 1
+                continue
+            image = image.convert("RGB")
             image_tensor = process_images([image], image_processor, args)
-            batch_images.append(image_tensor)
+            image_tensor = image_tensor.to(device=device, dtype=torch.float16)
+        except Exception as e:
+            print(f"\n[WARNING] Skipping sample {idx} due to image error: {e}")
+            skipped += 1
+            continue
 
-            # Tokenize input
-            input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
-            batch_input_ids.append(input_ids)
+        # Get question and answer
+        question = example.get("question", example.get("questions", [""])[0])
+        answer = example.get("answer", example.get("answers", [""])[0])
 
-            batch_questions.append(question)
-            batch_answers.append(answer)
+        # Create conversation
+        conv = conv_templates[conv_mode].copy()
+        inp = DEFAULT_IMAGE_TOKEN + "\n" + question
+        conv.append_message(conv.roles[0], inp)
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
 
-        # Stack images
-        batch_images = torch.cat(batch_images, dim=0).to(device, dtype=torch.float16)
+        # Tokenize
+        input_ids = tokenizer_image_token(
+            prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
+        ).unsqueeze(0).to(device)
 
-        # Pad input_ids to same length
-        max_len = max(ids.shape[0] for ids in batch_input_ids)
-        padded_input_ids = []
-        attention_mask = []
-        for ids in batch_input_ids:
-            padding_length = max_len - ids.shape[0]
-            padded_ids = torch.cat([
-                torch.full((padding_length,), tokenizer.pad_token_id, dtype=ids.dtype),
-                ids
-            ])
-            padded_input_ids.append(padded_ids)
-            mask = torch.cat([
-                torch.zeros(padding_length, dtype=torch.long),
-                torch.ones(ids.shape[0], dtype=torch.long)
-            ])
-            attention_mask.append(mask)
-
-        batch_input_ids = torch.stack(padded_input_ids).to(device)
-        attention_mask = torch.stack(attention_mask).to(device)
-
-        # Generate (greedy decoding for deterministic results)
+        # Generate (greedy decoding, like FastV)
         with torch.inference_mode():
             output_ids = model.generate(
-                batch_input_ids,
-                images=batch_images,
-                attention_mask=attention_mask,
+                input_ids,
+                images=image_tensor,
                 do_sample=False,
-                num_beams=1,
                 max_new_tokens=50,
-                use_cache=False,  # Disable KV cache to avoid cache_position compatibility issues
+                use_cache=True,
             )
 
-        # Decode outputs
-        for i, output_id in enumerate(output_ids):
-            # Find the start of generated text (after input)
-            input_len = batch_input_ids[i].shape[0]
-            output = tokenizer.decode(output_id[input_len:], skip_special_tokens=True).strip()
+        # Decode (output_ids only contains generated tokens, not input)
+        output = tokenizer.decode(
+            output_ids[0], skip_special_tokens=True
+        ).strip().replace("</s>", "")
 
-            sample_idx = start_idx + i
-            results.append({
-                'sample_id': sample_idx,
-                'question': batch_questions[i],
-                'ground_truth': batch_answers[i],
-                'prediction': output
-            })
+        predictions.append(output)
+        labels.append([answer])
 
-            # Print first few examples
-            if sample_idx < 5:
-                print(f"\nExample {sample_idx}:")
-                print(f"  Q: {batch_questions[i]}")
-                print(f"  GT: {batch_answers[i]}")
-                print(f"  Pred: {output}")
+        # Print first few examples
+        if idx < 5:
+            print(f"\nExample {idx}:")
+            print(f"  Q:  {question}")
+            print(f"  GT: {answer}")
+            print(f"  Pred: '{output}'")
 
-    return results
+    print(f"\nSkipped {skipped} samples due to errors")
+    return predictions, labels
 
 
-def compute_metrics(results):
+def compute_rouge(labels, predictions):
     """
-    Compute evaluation metrics.
+    Compute ROUGE score like FastV.
     """
-    total = len(results)
+    from pycocoevalcap.rouge.rouge import Rouge
 
-    # Exact match (case-insensitive)
-    exact_match = sum(1 for r in results if r['prediction'].lower().strip() == r['ground_truth'].lower().strip())
-    exact_match_acc = exact_match / total if total > 0 else 0
+    scorer = Rouge()
+    labels_dict = {}
+    predictions_dict = {}
 
-    # Partial match (prediction contains ground truth or vice versa)
-    partial_match = sum(1 for r in results
-                       if r['ground_truth'].lower() in r['prediction'].lower()
-                       or r['prediction'].lower() in r['ground_truth'].lower())
-    partial_match_acc = partial_match / total if total > 0 else 0
+    for i in range(len(labels)):
+        labels_dict[i] = [clean_text(t) for t in labels[i]]
+        predictions_dict[i] = [clean_text(predictions[i])]
 
-    metrics = {
-        'total_samples': total,
-        'exact_match': exact_match,
-        'exact_match_accuracy': exact_match_acc,
-        'partial_match': partial_match,
-        'partial_match_accuracy': partial_match_acc
-    }
-
-    return metrics
+    (score, scores) = scorer.compute_score(labels_dict, predictions_dict)
+    return score, scores
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate baseline LLaVA model on OCR-VQA')
-    parser.add_argument('--model_path', type=str, default='/gpfs/volcano/models/llava-v1.5-7b',
-                        help='Path to LLaVA model')
-    parser.add_argument('--dataset_path', type=str, default='/gpfs/volcano/models/howard-hou-OCR-VQA',
-                        help='Path to OCR-VQA dataset')
-    parser.add_argument('--output_dir', type=str, default='./baseline_results',
-                        help='Directory to save results')
-    parser.add_argument('--num_eval_samples', type=int, default=None,
-                        help='Number of samples for evaluation (None = use all test data)')
-    parser.add_argument('--batch_size', type=int, default=256,
-                        help='Batch size for evaluation')
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='Device to run on')
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Evaluate baseline LLaVA model on OCR-VQA"
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default="/gpfs/volcano/models/llava-v1.5-7b",
+        help="Path to LLaVA model",
+    )
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default="/gpfs/volcano/models/howard-hou-OCR-VQA",
+        help="Path to OCR-VQA dataset",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./baseline_results",
+        help="Directory to save results",
+    )
+    parser.add_argument(
+        "--num_eval_samples",
+        type=int,
+        default=None,
+        help="Number of samples for evaluation (None = use all test data)",
+    )
+    parser.add_argument(
+        "--device", type=str, default="cuda", help="Device to run on"
+    )
 
     args = parser.parse_args()
 
-    # Create output directory with timestamp
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_dir = os.path.join(args.output_dir, f'baseline_{timestamp}')
+    # 输出目录
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(args.output_dir, f"baseline_{timestamp}")
     os.makedirs(output_dir, exist_ok=True)
 
-    print("="*80)
+    print("=" * 80)
     print("Baseline LLaVA Model Evaluation on OCR-VQA")
-    print("="*80)
+    print("=" * 80)
     print(f"Model: {args.model_path}")
     print(f"Dataset: {args.dataset_path}")
     print(f"Output: {output_dir}")
     print(f"Evaluation samples: {args.num_eval_samples}")
-    print("="*80)
+    print("=" * 80)
 
-    # Load model
+    # 加载模型
     print("\nLoading model...")
     disable_torch_init()
     model_name = get_model_name_from_path(args.model_path)
@@ -217,17 +248,17 @@ def main():
         model_path=args.model_path,
         model_base=None,
         model_name=model_name,
-        device=args.device
+        device=args.device,
     )
     print(f"Model loaded: {model_name}")
     print(f"Context length: {context_len}")
 
-    # Load dataset
+    # 加载数据集（test split）
     print("\nLoading dataset...")
     dataset = load_dataset(args.dataset_path)["test"]
     print(f"Dataset loaded: {len(dataset)} total samples")
 
-    # Use all test data if num_eval_samples is None
+    # 确定评估样本数
     if args.num_eval_samples is None:
         num_eval_samples = len(dataset)
         print(f"Will evaluate on ALL {num_eval_samples} test samples")
@@ -235,66 +266,45 @@ def main():
         num_eval_samples = min(args.num_eval_samples, len(dataset))
         print(f"Will evaluate on {num_eval_samples} samples")
 
-    # Evaluate on OCR-VQA
-    eval_results = evaluate_ocrvqa(
-        model, tokenizer, image_processor, dataset,
-        num_eval_samples, args.device, args.batch_size
+    # 评估
+    predictions, labels = evaluate_ocrvqa(
+        model, tokenizer, image_processor, dataset, num_eval_samples, args.device
     )
 
-    # Compute metrics
-    metrics = compute_metrics(eval_results)
+    # 计算ROUGE指标（like FastV）
+    rouge_score, rouge_scores = compute_rouge(labels, predictions)
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("Evaluation Metrics:")
-    print("="*80)
-    print(f"Total samples: {metrics['total_samples']}")
-    print(f"Exact match: {metrics['exact_match']} ({metrics['exact_match_accuracy']:.4f})")
-    print(f"Partial match: {metrics['partial_match']} ({metrics['partial_match_accuracy']:.4f})")
-    print("="*80)
+    print("=" * 80)
+    print(f"Total samples: {len(predictions)}")
+    print(f"ROUGE score: {rouge_score:.4f}")
+    print("=" * 80)
 
-    # Save evaluation results
-    eval_path = os.path.join(output_dir, 'evaluation_results.json')
-    with open(eval_path, 'w') as f:
-        json.dump(eval_results, f, indent=2, ensure_ascii=False)
+    # 保存详细结果
+    results_dict = {
+        "predictions": predictions,
+        "labels": labels,
+        "rouge_scores": rouge_scores.tolist()
+    }
+    eval_path = os.path.join(output_dir, "evaluation_results.json")
+    with open(eval_path, "w") as f:
+        json.dump(results_dict, f, indent=2, ensure_ascii=False)
     print(f"\nEvaluation results saved to {eval_path}")
 
-    # Save metrics
-    metrics_path = os.path.join(output_dir, 'metrics.json')
-    with open(metrics_path, 'w') as f:
-        json.dump(metrics, f, indent=2)
-    print(f"Metrics saved to {metrics_path}")
-
-    # Save summary
+    # 保存 summary
     summary = {
-        'model': args.model_path,
-        'dataset': args.dataset_path,
-        'num_eval_samples': num_eval_samples,
-        'metrics': metrics,
-        'timestamp': timestamp,
-        'model_type': 'baseline (unpruned)'
+        "model": args.model_path,
+        "dataset": args.dataset_path,
+        "num_eval_samples": len(predictions),
+        "rouge_score": float(rouge_score),
+        "timestamp": timestamp,
+        "model_type": "baseline (unpruned)",
     }
-
-    summary_path = os.path.join(output_dir, 'summary.json')
-    with open(summary_path, 'w') as f:
+    summary_path = os.path.join(output_dir, "summary.json")
+    with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"Summary saved to {summary_path}")
-
-    # Create a simple report
-    report_path = os.path.join(output_dir, 'report.txt')
-    with open(report_path, 'w') as f:
-        f.write("="*80 + "\n")
-        f.write("Baseline LLaVA Model Evaluation Report\n")
-        f.write("="*80 + "\n")
-        f.write(f"Model: {args.model_path}\n")
-        f.write(f"Dataset: {args.dataset_path}\n")
-        f.write(f"Timestamp: {timestamp}\n")
-        f.write(f"Evaluation samples: {num_eval_samples}\n")
-        f.write("\n")
-        f.write("Metrics:\n")
-        f.write(f"  Exact Match Accuracy: {metrics['exact_match_accuracy']:.4f} ({metrics['exact_match']}/{metrics['total_samples']})\n")
-        f.write(f"  Partial Match Accuracy: {metrics['partial_match_accuracy']:.4f} ({metrics['partial_match']}/{metrics['total_samples']})\n")
-        f.write("="*80 + "\n")
-    print(f"Report saved to {report_path}")
 
     print(f"\nAll results saved to {output_dir}")
 
