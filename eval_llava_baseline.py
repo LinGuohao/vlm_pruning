@@ -18,7 +18,11 @@ from llava.utils import disable_torch_init
 from llava.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
 from llava.conversation import conv_templates
+# # 测试前5000个样本
+# python eval_llava_baseline.py --num_eval_samples 5000
 
+# # 测试全部数据
+# python eval_llava_baseline.py
 # ============ Text normalization (from FastV) ============
 contractions = {"aint": "ain't", "arent": "aren't", "cant": "can't", "couldve": "could've", "couldnt": "couldn't", \
                 "couldn'tve": "couldn't've", "couldnt've": "couldn't've", "didnt": "didn't", "doesnt": "doesn't", "dont": "don't", "hadnt": "hadn't", \
@@ -218,7 +222,7 @@ def main():
         "--num_eval_samples",
         type=int,
         default=None,
-        help="Number of samples for evaluation (None = use all test data)",
+        help="Number of samples to evaluate (first N samples from test set, None = use all test data)",
     )
     parser.add_argument(
         "--device", type=str, default="cuda", help="Device to run on"
@@ -258,13 +262,14 @@ def main():
     dataset = load_dataset(args.dataset_path)["test"]
     print(f"Dataset loaded: {len(dataset)} total samples")
 
-    # 确定评估样本数
+    # 确定评估样本数（使用前N个样本，保证每次顺序一致）
     if args.num_eval_samples is None:
         num_eval_samples = len(dataset)
-        print(f"Will evaluate on ALL {num_eval_samples} test samples")
+        print(f"Will evaluate on ALL {num_eval_samples} test samples (full test set)")
     else:
         num_eval_samples = min(args.num_eval_samples, len(dataset))
-        print(f"Will evaluate on {num_eval_samples} samples")
+        print(f"Will evaluate on FIRST {num_eval_samples} samples from test set")
+        print(f"(Using first N samples ensures consistent test set between runs)")
 
     # 评估
     predictions, labels = evaluate_ocrvqa(
